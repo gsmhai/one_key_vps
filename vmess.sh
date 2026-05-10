@@ -95,8 +95,8 @@ SETTINGS="{\"clients\":[{\"id\":\"$UUID\",\"alterId\":0,\"email\":\"vmess_$UUID\
 STREAM_SETTINGS="{\"network\":\"tcp\",\"security\":\"none\",\"tcpSettings\":{\"acceptProxyProtocol\":false,\"header\":{\"type\":\"none\"}}}"
 SNIFFING="{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}"
 
-sqlite3 $DB_PATH "DELETE FROM inbounds WHERE remark = 'Auto_VMESS_Node';"
-sqlite3 $DB_PATH "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing) VALUES (1, 0, 0, 0, 'Auto_VMESS_Node', 1, 0, '', $NODE_PORT, 'vmess', '$SETTINGS', '$STREAM_SETTINGS', 'inbound-$NODE_PORT', '$SNIFFING');"
+sqlite3 $DB_PATH "DELETE FROM inbounds WHERE remark = 'VMESS';"
+sqlite3 $DB_PATH "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing) VALUES (1, 0, 0, 0, 'VMESS', 1, 0, '', $NODE_PORT, 'vmess', '$SETTINGS', '$STREAM_SETTINGS', 'inbound-$NODE_PORT', '$SNIFFING');"
 
 # ==================================================================
 # 【备用方案】 VLESS 节点配置注入 
@@ -106,8 +106,8 @@ sqlite3 $DB_PATH "INSERT INTO inbounds (user_id, up, down, total, remark, enable
 # VLESS_STREAM="{\"network\":\"tcp\",\"security\":\"none\",\"tcpSettings\":{\"acceptProxyProtocol\":false,\"header\":{\"type\":\"none\"}}}"
 # VLESS_SNIFFING="{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}"
 #
-# sqlite3 $DB_PATH "DELETE FROM inbounds WHERE remark = 'Auto_VLESS_Node';"
-# sqlite3 $DB_PATH "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing) VALUES (1, 0, 0, 0, 'Auto_VLESS_Node', 1, 0, '', $NODE_PORT, 'vless', '$VLESS_SETTINGS', '$VLESS_STREAM', 'inbound-$NODE_PORT', '$VLESS_SNIFFING');"
+# sqlite3 $DB_PATH "DELETE FROM inbounds WHERE remark = 'Auto_VLESS';"
+# sqlite3 $DB_PATH "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing) VALUES (1, 0, 0, 0, 'Auto_VLESS', 1, 0, '', $NODE_PORT, 'vless', '$VLESS_SETTINGS', '$VLESS_STREAM', 'inbound-$NODE_PORT', '$VLESS_SNIFFING');"
 # ==================================================================
 
 systemctl start x-ui
@@ -128,13 +128,13 @@ firewall-cmd --zone=public --add-port=${NODE_PORT}/tcp --permanent > /dev/null 2
 firewall-cmd --reload > /dev/null 2>&1
 
 # 生成分享链接
-VMESS_JSON="{\"v\":\"2\",\"ps\":\"Auto_VMESS_Node\",\"add\":\"${PUBLIC_IP}\",\"port\":\"${NODE_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"tcp\",\"type\":\"none\",\"host\":\"\",\"path\":\"\",\"tls\":\"\",\"sni\":\"\",\"alpn\":\"\",\"fp\":\"\"}"
+VMESS_JSON="{\"v\":\"2\",\"ps\":\"VMESS\",\"add\":\"${PUBLIC_IP}\",\"port\":\"${NODE_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"tcp\",\"type\":\"none\",\"host\":\"\",\"path\":\"\",\"tls\":\"\",\"sni\":\"\",\"alpn\":\"\",\"fp\":\"\"}"
 SHARE_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 -w 0)"
 SUB_URL="https://${PUBLIC_IP}:${REAL_PANEL_PORT}${REAL_BASE_PATH}sub/${SUB_ID}"
 
 # ==================================================================
 # 备用 VLESS 链接生成 
-# VLESS_SHARE_LINK="vless://${UUID}@${PUBLIC_IP}:${NODE_PORT}?encryption=none&security=none&type=tcp#Auto_VLESS_Node"
+# VLESS_SHARE_LINK="vless://${UUID}@${PUBLIC_IP}:${NODE_PORT}?encryption=none&security=none&type=tcp#Auto_VLESS"
 # ==================================================================
 
 echo ""
