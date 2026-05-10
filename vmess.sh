@@ -43,9 +43,10 @@ spawn bash -c "bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/
 
 expect {
     "*customize*" { send "y\r"; exp_continue }
-    "*Account name:*" { send "$env(PANEL_USER)\r"; exp_continue }
-    "*Account password:*" { send "$env(PANEL_PASS)\r"; exp_continue }
+    "*panel port:*" { send "$env(PANEL_PORT)\r"; exp_continue }
     "*Panel port:*" { send "$env(PANEL_PORT)\r"; exp_continue }
+    "*ccount name:*" { send "$env(PANEL_USER)\r"; exp_continue }
+    "*ccount password:*" { send "$env(PANEL_PASS)\r"; exp_continue }
     "*(default 2 for IP):*" { send "2\r"; exp_continue }
     eof
 }
