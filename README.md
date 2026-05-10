@@ -7,20 +7,22 @@ CentOS 9.4 服务器上一键自动化部署 3x-ui 面板、VMESS 代理节点�
   ### 1. 直接在服务器上创建该脚本文件并赋予执行权限：
 
 ```bash
-  curl -O https://raw.githubusercontent.com/gsmhai/one_key_vps/main/vmess.sh
-  chmod +x vmess.sh
+curl -O https://raw.githubusercontent.com/gsmhai/one_key_vps/main/vmess.sh
+chmod +x vmess.sh
 ```
-### 2.用户名密码配置
-如果想修改web面板的用户名和密码，手动编辑文件开头的用户名和密码，默认用户名密码都为:admin，如果不想改直接跳过
-```bash
-  PANEL_USER="admin"   # 面板登录用户名
-  PANEL_PASS="admin"   # 面板登录密码
-```
-### 3. 执行脚本
+### 2. 执行脚本
 运行环境要求：CentOS 9.4 (自带 Firewalld 防火墙控制)
 ```bash
 bash vmess.sh
 ```
+### 3.用户名密码配置
+如果想修改web面板的用户名和密码，手动编辑文件开头的用户名和密码，默认用户名密码都为:admin，如果不想改直接跳过
+```bash
+PANEL_USER="admin"   # 面板登录用户名
+PANEL_PASS="admin"   # 面板登录密码
+```
+
+
 
 ## 脚本说明
 
