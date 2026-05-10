@@ -63,6 +63,9 @@ expect {
     eof { exit 0 }
 }
 EOF
+# 强制更新面板端口
+# sqlite3 $DB_PATH "UPDATE settings SET value = '$RANDOM_PANEL_PORT' WHERE key = 'panelPort' OR key = 'port' OR key = 'webPort';"
+
 chmod +x reset_cred.exp
 ./reset_cred.exp
 rm -f install_xui.exp reset_cred.exp
@@ -101,7 +104,7 @@ sleep 2
 
 # 5. 读取真实配置
 echo -e "\n[5/6] 正在从数据库校验最终配置..."
-REAL_PANEL_PORT=$(sqlite3 $DB_PATH "SELECT value FROM settings WHERE key='panelPort';")
+REAL_PANEL_PORT=$(sqlite3 $DB_PATH "SELECT value FROM settings WHERE key='port' OR key='panelPort' OR key='webPort' LIMIT 1;")
 REAL_BASE_PATH=$(sqlite3 $DB_PATH "SELECT value FROM settings WHERE key='webBasePath';" | tr -d '"')
 PUBLIC_IP=$(curl -s ifconfig.me || curl -s ipv4.icanhazip.com)
 
