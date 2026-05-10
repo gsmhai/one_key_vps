@@ -56,9 +56,20 @@ expect -re "(password|密码)" { send "$env(PANEL_PASS)\r" }
 
 # 处理结尾随机出现的 2FA 和重启提示 (动态循环捕获)
 expect {
-    -re "(two-factor|双因素|2FA)" { send "y\r"; exp_continue }
-    -re "(Restart|重启)" { send "y\r"; exp_continue }
-    -re "(return|返回|enter|回车)" { send "\r"; exit 0 }
+    -re "(two-factor|双因素|2FA)" { 
+        send "y\r"
+        exp_continue 
+    }
+    -nocase -re "(restart the panel|重启面板)" { 
+        send "y\r"
+        # 发送完 y 后，直接等待最后的回车提示，不再循环
+        expect -re "(return|返回|enter|回车)" { send "\r" }
+        exit 0
+    }
+    -re "(return|返回|enter|回车)" { 
+        send "\r"
+        exit 0 
+    }
     timeout { exit 0 }
     eof { exit 0 }
 }
