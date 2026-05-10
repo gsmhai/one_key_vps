@@ -7,7 +7,7 @@ CentOS 9.4 服务器上一键自动化部署 3x-ui 面板、VMESS 代理节点�
   ### 1. 直接在服务器上创建该脚本文件并赋予执行权限：
 
 ```bash
-  curl -O https://raw.githubusercontent.com/gsmhai/one_key_vps/blob/main/vmess.sh
+  curl -O https://raw.githubusercontent.com/gsmhai/one_key_vps/main/vmess.sh
   chmod +x vmess.sh
 ```
 ### 2.用户名密码配置
