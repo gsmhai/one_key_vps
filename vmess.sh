@@ -42,6 +42,7 @@ set timeout -1
 spawn bash -c "bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)"
 
 expect {
+    "*customize*" { send "y\r"; exp_continue }
     "*Account name:*" { send "$env(PANEL_USER)\r"; exp_continue }
     "*Account password:*" { send "$env(PANEL_PASS)\r"; exp_continue }
     "*Panel port:*" { send "$env(PANEL_PORT)\r"; exp_continue }
