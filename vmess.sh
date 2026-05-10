@@ -49,6 +49,7 @@ expect {
     "*ccount password:*" { send "$env(PANEL_PASS)\r"; exp_continue }
     "*(default 2 for IP):*" { send "2\r"; exp_continue }
     "*IPv6 address to include*" { send "\r"; exp_continue }
+    "*ACME HTTP-01*" { send "80\r"; exp_continue }
     eof
 }
 EOF
