@@ -25,7 +25,7 @@ echo -e "\n[2/6] 正在启动 3x-ui 安装流程..."
 export PANEL_USER PANEL_PASS RANDOM_PANEL_PORT
 cat << 'EOF' > install_xui.exp
 #!/usr/bin/expect -f
-set timeout 300
+# set timeout 300
 spawn bash -c "bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)"
 expect {
     -re "customize.*y/n" { send "y\r"; exp_continue }
