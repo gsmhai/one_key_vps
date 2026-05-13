@@ -100,8 +100,8 @@ else
 fi
 
 # 生成最终的节点备注名称
-VMESS_REMARK="${REGION}_VMESS"
-VLESS_REMARK="${REGION}_VLESS"
+VMESS_REMARK="${REGION}"
+VLESS_REMARK="${REGION}"
 echo "✅ 成功识别地区信息: $REGION"
 
 # 6. 注入代理节点
