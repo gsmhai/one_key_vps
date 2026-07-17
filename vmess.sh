@@ -4,7 +4,22 @@
 # ！！！请在这里修改为你自己想要的面板用户名和密码！！！
 PANEL_USER="admin"        # 面板登录用户名
 PANEL_PASS="admin"        # 面板登录密码
+
+# 是否同时生成 VLESS+Reality 节点: 0=只生成 VMESS(默认), 1=同时生成 VMESS 和 VLESS
+# 两种开启方式任选其一:
+#   1) 直接把下面的值改为 1
+#   2) 运行脚本时带上参数: bash vmess.sh vless  (或 --vless)
+VLESS_ON=0
 # ==================================================================
+
+# 解析命令行参数
+for arg in "$@"; do
+    case "$arg" in
+        vless|--vless|-vless)
+            VLESS_ON=1
+            ;;
+    esac
+done
 
 # 必须以 root 运行（安装依赖、写 /etc/x-ui、配置防火墙都需要 root）
 if [ "$(id -u)" -ne 0 ]; then
@@ -27,6 +42,8 @@ pick_free_port() {
 
 RANDOM_PANEL_PORT=$(pick_free_port 40000)
 NODE_PORT=$(pick_free_port 50000)
+VLESS_PORT=""
+[ "$VLESS_ON" = "1" ] && VLESS_PORT=$(pick_free_port 30000)   # VLESS+Reality 节点端口
 SUB_PORT=2096   # 3x-ui 订阅服务端口
 
 echo "===================================================="
@@ -73,6 +90,7 @@ if [ "$PM" = "apt" ]; then
     ufw allow 80/tcp > /dev/null 2>&1
     ufw allow ${RANDOM_PANEL_PORT}/tcp > /dev/null 2>&1
     ufw allow ${NODE_PORT}/tcp > /dev/null 2>&1
+    [ "$VLESS_ON" = "1" ] && ufw allow ${VLESS_PORT}/tcp > /dev/null 2>&1
     ufw allow ${SUB_PORT}/tcp > /dev/null 2>&1
     ufw --force enable > /dev/null 2>&1
     ufw reload > /dev/null 2>&1
@@ -83,6 +101,7 @@ else
     firewall-cmd --zone=public --add-port=80/tcp --permanent > /dev/null 2>&1
     firewall-cmd --zone=public --add-port=${RANDOM_PANEL_PORT}/tcp --permanent > /dev/null 2>&1
     firewall-cmd --zone=public --add-port=${NODE_PORT}/tcp --permanent > /dev/null 2>&1
+    [ "$VLESS_ON" = "1" ] && firewall-cmd --zone=public --add-port=${VLESS_PORT}/tcp --permanent > /dev/null 2>&1
     firewall-cmd --zone=public --add-port=${SUB_PORT}/tcp --permanent > /dev/null 2>&1
     firewall-cmd --reload > /dev/null 2>&1
 fi
@@ -110,19 +129,34 @@ echo -e "\n[4/7] 正在设置面板账号密码与端口..."
 /usr/local/x-ui/x-ui setting -port "$RANDOM_PANEL_PORT" > /dev/null 2>&1
 
 # 5. 获取本机 IP 及地理位置信息
-echo -e "\n[5/7] 正在获取服务器公网 IP 及物理地区信息..."
-PUBLIC_IP=$(curl -s --max-time 10 https://api.ipify.org)
-[ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(curl -s --max-time 10 ifconfig.me)
-[ -z "$PUBLIC_IP" ] && PUBLIC_IP=$(curl -s --max-time 10 ipv4.icanhazip.com)
-PUBLIC_IP=$(echo "$PUBLIC_IP" | tr -d ' \r\n')
+echo -e "\n[5/7] 正在获取服务器 IP 及物理地区信息..."
+# 以本机默认路由出口 IP 为准（最终链接统一使用该 IP）
+LOCAL_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}')
+[ -z "$LOCAL_IP" ] && LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+LOCAL_IP=$(echo "$LOCAL_IP" | tr -d ' \r\n')
 
+# 外部探测公网 IP，仅用于和本机 IP 比对告警，不作为最终地址
+EXTERNAL_IP=$(curl -s --max-time 10 https://api.ipify.org)
+[ -z "$EXTERNAL_IP" ] && EXTERNAL_IP=$(curl -s --max-time 10 ifconfig.me)
+[ -z "$EXTERNAL_IP" ] && EXTERNAL_IP=$(curl -s --max-time 10 ipv4.icanhazip.com)
+EXTERNAL_IP=$(echo "$EXTERNAL_IP" | tr -d ' \r\n')
+
+if [ -z "$EXTERNAL_IP" ]; then
+    echo "⚠️  警告: 无法从外部探测公网 IP（网络受限或探测接口不可用），将直接使用本机 IP: ${LOCAL_IP:-未知}"
+elif [ -n "$LOCAL_IP" ] && [ "$EXTERNAL_IP" != "$LOCAL_IP" ]; then
+    echo "⚠️  警告: 外部探测到的公网 IP ($EXTERNAL_IP) 与本机默认 IP ($LOCAL_IP) 不一致，"
+    echo "   本机可能位于 NAT 之后，最终链接将使用本机 IP: $LOCAL_IP，如无法连接请手动替换为公网 IP。"
+fi
+
+PUBLIC_IP="$LOCAL_IP"
 if [ -z "$PUBLIC_IP" ]; then
     PUBLIC_IP="YOUR_SERVER_IP"
     REGION="未知_地区"
-    echo "⚠️  警告: 无法获取公网 IP，最终链接中的地址请手动替换为你的服务器 IP！"
+    echo "⚠️  警告: 无法获取本机 IP，最终链接中的地址请手动替换为你的服务器 IP！"
 else
-    # 一次请求同时取国家和城市，减少 API 调用次数
-    GEO_INFO=$(curl -s --max-time 10 "http://ip-api.com/line/${PUBLIC_IP}?fields=country,city&lang=zh-CN")
+    # 地理位置用外部探测 IP 查询（本机 IP 可能是 NAT 内网地址，无法定位）；
+    # 外部 IP 也没有时留空，ip-api 会按请求来源 IP 定位
+    GEO_INFO=$(curl -s --max-time 10 "http://ip-api.com/line/${EXTERNAL_IP}?fields=country,city&lang=zh-CN")
     GEO_COUNTRY=$(echo "$GEO_INFO" | sed -n '1p')
     GEO_CITY=$(echo "$GEO_INFO" | sed -n '2p')
 
@@ -135,8 +169,8 @@ fi
 # 清洗节点名：去掉空白和单引号，防止特殊地名破坏 SQL 语句和分享链接
 REGION=$(echo "$REGION" | tr -d " '\r\n\"")
 REGION=${REGION%_}
-VMESS_REMARK="${REGION}"
-VLESS_REMARK="${REGION}"
+VMESS_REMARK="${REGION}_vmess"
+VLESS_REMARK="${REGION}_vless_reality"
 echo "✅ 成功识别地区信息: $REGION"
 
 # 6. 注入初始代理节点
@@ -153,6 +187,7 @@ if [ ! -f "$DB_PATH" ]; then
 fi
 
 UUID=$(cat /proc/sys/kernel/random/uuid)
+VLESS_UUID=$(cat /proc/sys/kernel/random/uuid)
 SUB_ID=$(cat /proc/sys/kernel/random/uuid | tr -d '-')
 
 # ==================================================================
@@ -170,9 +205,44 @@ if [ "$INBOUND_COUNT" != "1" ]; then
 fi
 
 # ==================================================================
-# 【备用方案】 VLESS 节点配置注入 (默认被注释)
-# 如果你需要改为 VLESS，请将上方 VMESS 的三个 sqlite3 语句注释掉，并解除下方代码的注释：
-# ... (保留原注释代码)
+# 【可选】 VLESS + Reality 节点配置注入（由 VLESS_ON 变量或 vless 参数控制）
+VLESS_ENABLED=0
+if [ "$VLESS_ON" = "1" ]; then
+# Reality 伪装目标站点（需为支持 TLSv1.3 + H2 的真实站点，可按需修改）
+REALITY_DEST="yahoo.com:443"
+REALITY_SNI="yahoo.com"
+
+# 用 3x-ui 自带的 xray 二进制生成 Reality 密钥对
+XRAY_BIN=$(ls /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -n 1)
+REALITY_KEYS=""
+if [ -n "$XRAY_BIN" ]; then
+    REALITY_KEYS=$("$XRAY_BIN" x25519 2>/dev/null)
+fi
+# 兼容新旧版 xray 的输出格式:
+# 旧版: "Private key: xxx / Public key: xxx"
+# 新版: "PrivateKey: xxx / Password: xxx"
+REALITY_PRIVATE_KEY=$(echo "$REALITY_KEYS" | grep -i "private" | head -n 1 | awk '{print $NF}')
+REALITY_PUBLIC_KEY=$(echo "$REALITY_KEYS" | grep -iE "public|password" | head -n 1 | awk '{print $NF}')
+REALITY_SHORT_ID=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+
+if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
+    echo "⚠️  警告: Reality 密钥对生成失败，跳过 VLESS 节点注入（VMESS 节点不受影响）。"
+    VLESS_ENABLED=0
+else
+    VLESS_ENABLED=1
+    VLESS_SETTINGS="{\"clients\":[{\"id\":\"$VLESS_UUID\",\"flow\":\"xtls-rprx-vision\",\"email\":\"vless_$VLESS_UUID\",\"limitIp\":0,\"totalGB\":0,\"expiryTime\":0,\"enable\":true,\"tgId\":\"\",\"subId\":\"$SUB_ID\"}],\"decryption\":\"none\",\"fallbacks\":[]}"
+    VLESS_STREAM_SETTINGS="{\"network\":\"tcp\",\"security\":\"reality\",\"externalProxy\":[],\"realitySettings\":{\"show\":false,\"xver\":0,\"dest\":\"$REALITY_DEST\",\"serverNames\":[\"$REALITY_SNI\"],\"privateKey\":\"$REALITY_PRIVATE_KEY\",\"minClient\":\"\",\"maxClient\":\"\",\"maxTimediff\":0,\"shortIds\":[\"$REALITY_SHORT_ID\"],\"settings\":{\"publicKey\":\"$REALITY_PUBLIC_KEY\",\"fingerprint\":\"chrome\",\"serverName\":\"\",\"spiderX\":\"/\"}},\"tcpSettings\":{\"acceptProxyProtocol\":false,\"header\":{\"type\":\"none\"}}}"
+
+    sqlite3 $DB_PATH "DELETE FROM inbounds WHERE remark = '$VLESS_REMARK';"
+    sqlite3 $DB_PATH "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing) VALUES (1, 0, 0, 0, '$VLESS_REMARK', 1, 0, '', $VLESS_PORT, 'vless', '$VLESS_SETTINGS', '$VLESS_STREAM_SETTINGS', 'inbound-$VLESS_PORT', '$SNIFFING');"
+
+    VLESS_COUNT=$(sqlite3 $DB_PATH "SELECT COUNT(*) FROM inbounds WHERE port = $VLESS_PORT;")
+    if [ "$VLESS_COUNT" != "1" ]; then
+        echo "❌ 严重错误: VLESS 节点写入数据库失败，请手动登录面板添加节点。"
+        VLESS_ENABLED=0
+    fi
+fi
+fi
 # ==================================================================
 
 # 启用订阅服务（3x-ui 默认关闭订阅，不开启的话订阅链接无法访问）
@@ -220,6 +290,11 @@ fi
 VMESS_JSON="{\"v\":\"2\",\"ps\":\"${VMESS_REMARK}\",\"add\":\"${PUBLIC_IP}\",\"port\":\"${NODE_PORT}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"tcp\",\"type\":\"none\",\"host\":\"\",\"path\":\"\",\"tls\":\"\",\"sni\":\"\",\"alpn\":\"\",\"fp\":\"\"}"
 SHARE_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 | tr -d '\n')"
 
+# VLESS + Reality 分享链接（vless:// 为明文 URL 格式，无需 base64）
+if [ "$VLESS_ENABLED" = "1" ]; then
+    VLESS_SHARE_LINK="vless://${VLESS_UUID}@${PUBLIC_IP}:${VLESS_PORT}?type=tcp&security=reality&pbk=${REALITY_PUBLIC_KEY}&fp=chrome&sni=${REALITY_SNI}&sid=${REALITY_SHORT_ID}&spx=%2F&flow=xtls-rprx-vision#${VLESS_REMARK}"
+fi
+
 SUB_URL="http://${PUBLIC_IP}:${SUB_PORT}/sub/${SUB_ID}"
 CLASH_SUB_URL="http://${PUBLIC_IP}:${SUB_PORT}/clash/${SUB_ID}"
 JSON_SUB_URL="http://${PUBLIC_IP}:${SUB_PORT}/json/${SUB_ID}"
@@ -237,6 +312,12 @@ echo "🚀 【单节点链接 (VMESS)】"
 echo "▶ 节点名称: $VMESS_REMARK"
 echo -e "\033[32m$SHARE_LINK\033[0m"
 echo "----------------------------------------------------"
+if [ "$VLESS_ENABLED" = "1" ]; then
+    echo "🚀 【单节点链接 (VLESS + Reality)】"
+    echo "▶ 节点名称: $VLESS_REMARK"
+    echo -e "\033[32m$VLESS_SHARE_LINK\033[0m"
+    echo "----------------------------------------------------"
+fi
 echo "📡 【通用订阅链接 (Base64, 通用客户端)】"
 echo -e "\033[36m$SUB_URL\033[0m"
 echo "----------------------------------------------------"
@@ -255,13 +336,29 @@ if [ "$PANEL_USER" = "admin" ] && [ "$PANEL_PASS" = "admin" ]; then
 fi
 
 # 8. 将部署结果写入当前目录的 log 文件（含账号密码，权限设为 600 仅 root 可读）
+# VLESS 节点信息块（仅在 VLESS 注入成功时写入日志）
+VLESS_LOG_BLOCK=""
+if [ "$VLESS_ENABLED" = "1" ]; then
+    VLESS_LOG_BLOCK="
+【VLESS + Reality 单节点链接】
+节点名称: ${VLESS_REMARK}
+节点端口: ${VLESS_PORT}
+UUID: ${VLESS_UUID}
+Reality 公钥: ${REALITY_PUBLIC_KEY}
+Reality ShortId: ${REALITY_SHORT_ID}
+伪装 SNI: ${REALITY_SNI}
+${VLESS_SHARE_LINK}
+"
+fi
+
 LOG_FILE="$(pwd)/vmess_deploy_$(date +%Y%m%d_%H%M%S).log"
 cat > "$LOG_FILE" << LOGEOF
 ====================================================
 3x-ui 部署结果记录
 部署时间: $(date '+%Y-%m-%d %H:%M:%S')
-服务器IP: ${PUBLIC_IP}
-节点地区: ${VMESS_REMARK}
+服务器IP(本机): ${PUBLIC_IP}
+外部探测IP: ${EXTERNAL_IP:-获取失败}
+节点地区: ${REGION}
 ====================================================
 
 【Web 面板】
@@ -274,6 +371,8 @@ cat > "$LOG_FILE" << LOGEOF
 节点端口: ${NODE_PORT}
 UUID: ${UUID}
 ${SHARE_LINK}
+${VLESS_LOG_BLOCK}
+【v2ray 通用订阅 (Base64)】
 
 【v2ray 通用订阅 (Base64)】
 适用于: v2rayN / v2rayNG / NekoBox 等通用客户端
