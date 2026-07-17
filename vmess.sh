@@ -187,6 +187,10 @@ set_setting() {
 set_setting "subEnable" "true"
 set_setting "subPort" "$SUB_PORT"
 set_setting "subPath" "/sub/"
+# 启用 Clash(Mihomo) 与 Xray-JSON 订阅格式（3x-ui 原生支持，默认关闭）
+# Clash 订阅路径 /clash/ -> YAML；JSON 订阅路径 /json/ -> Xray 客户端完整配置
+set_setting "subClashEnable" "true"
+set_setting "subJsonEnable" "true"
 
 systemctl start x-ui
 sleep 2
@@ -217,6 +221,8 @@ VMESS_JSON="{\"v\":\"2\",\"ps\":\"${VMESS_REMARK}\",\"add\":\"${PUBLIC_IP}\",\"p
 SHARE_LINK="vmess://$(echo -n "$VMESS_JSON" | base64 | tr -d '\n')"
 
 SUB_URL="http://${PUBLIC_IP}:${SUB_PORT}/sub/${SUB_ID}"
+CLASH_SUB_URL="http://${PUBLIC_IP}:${SUB_PORT}/clash/${SUB_ID}"
+JSON_SUB_URL="http://${PUBLIC_IP}:${SUB_PORT}/json/${SUB_ID}"
 
 echo ""
 echo "===================================================="
@@ -231,10 +237,64 @@ echo "🚀 【单节点链接 (VMESS)】"
 echo "▶ 节点名称: $VMESS_REMARK"
 echo -e "\033[32m$SHARE_LINK\033[0m"
 echo "----------------------------------------------------"
-echo "📡 【通用订阅链接】"
+echo "📡 【通用订阅链接 (Base64, 通用客户端)】"
 echo -e "\033[36m$SUB_URL\033[0m"
+echo "----------------------------------------------------"
+echo "📡 【Clash / Mihomo 订阅链接 (YAML)】"
+echo "▶ 适用于: Clash Verge / Clash Meta / Mihomo / Stash 等"
+echo -e "\033[36m$CLASH_SUB_URL\033[0m"
+echo "----------------------------------------------------"
+echo "📡 【Xray JSON 订阅链接】"
+echo "▶ 适用于: v2rayN / v2rayNG 等支持 Xray-JSON 订阅的客户端"
+echo "▶ sing-box 用户: 直接导入上方 Base64 通用订阅即可（sing-box 支持解析分享链接）"
+echo -e "\033[36m$JSON_SUB_URL\033[0m"
 echo "===================================================="
 if [ "$PANEL_USER" = "admin" ] && [ "$PANEL_PASS" = "admin" ]; then
     echo "⚠️  安全提醒: 面板正在使用默认账号密码 admin/admin 且以 HTTP 明文暴露公网，"
     echo "   请立即登录面板修改密码，并建议配置 TLS 证书！"
 fi
+
+# 8. 将部署结果写入当前目录的 log 文件（含账号密码，权限设为 600 仅 root 可读）
+LOG_FILE="$(pwd)/vmess_deploy_$(date +%Y%m%d_%H%M%S).log"
+cat > "$LOG_FILE" << LOGEOF
+====================================================
+3x-ui 部署结果记录
+部署时间: $(date '+%Y-%m-%d %H:%M:%S')
+服务器IP: ${PUBLIC_IP}
+节点地区: ${VMESS_REMARK}
+====================================================
+
+【Web 面板】
+地址: http://${PUBLIC_IP}:${REAL_PANEL_PORT}${REAL_BASE_PATH}
+账号: ${PANEL_USER}
+密码: ${PANEL_PASS}
+
+【VMESS 单节点链接】
+节点名称: ${VMESS_REMARK}
+节点端口: ${NODE_PORT}
+UUID: ${UUID}
+${SHARE_LINK}
+
+【v2ray 通用订阅 (Base64)】
+适用于: v2rayN / v2rayNG / NekoBox 等通用客户端
+${SUB_URL}
+
+【Clash / Mihomo 订阅 (YAML)】
+适用于: Clash Verge / Clash Meta / Mihomo / Stash 等
+${CLASH_SUB_URL}
+
+【sing-box 订阅】
+sing-box 支持解析分享链接，直接导入 Base64 通用订阅即可:
+${SUB_URL}
+
+【Xray JSON 订阅】
+适用于: v2rayN / v2rayNG 等支持 Xray-JSON 订阅的客户端
+${JSON_SUB_URL}
+
+====================================================
+⚠️  本文件包含面板账号密码，请妥善保管，不要泄露！
+====================================================
+LOGEOF
+# chmod 600 "$LOG_FILE"
+echo ""
+echo "📄 部署信息已保存到: $LOG_FILE"
