@@ -10,6 +10,10 @@ PANEL_PASS="admin"        # 面板登录密码
 #   1) 直接把下面的值改为 1
 #   2) 运行脚本时带上参数: bash vmess.sh vless  (或 --vless)
 VLESS_ON=0
+
+# 面板 HTTPS 证书方式: 0=使用 x-ui 官方 Let's Encrypt IP 证书(默认, 自动续期, 需 80 端口可达),
+#                      1=使用 openssl 自签名证书(浏览器会告警, 适合 80 端口被占/受限的环境)
+OPENSSL_ON=0
 # ==================================================================
 
 # 解析命令行参数
@@ -17,6 +21,9 @@ for arg in "$@"; do
     case "$arg" in
         vless|--vless|-vless)
             VLESS_ON=1
+            ;;
+        openssl|--openssl)
+            OPENSSL_ON=1
             ;;
     esac
 done
@@ -56,15 +63,15 @@ if command -v apt >/dev/null 2>&1; then
     PM="apt"
     apt update -y > /dev/null 2>&1
     # Debian/Ubuntu 的 sqlite 包名为 sqlite3，防火墙使用 ufw
-    apt install curl wget sqlite3 ufw coreutils iproute2 -y > /dev/null 2>&1
+    apt install curl wget sqlite3 ufw coreutils iproute2 openssl -y > /dev/null 2>&1
 elif command -v dnf >/dev/null 2>&1; then
     PM="dnf"
     dnf install epel-release -y > /dev/null 2>&1
-    dnf install curl wget sqlite firewalld coreutils iproute -y > /dev/null 2>&1
+    dnf install curl wget sqlite firewalld coreutils iproute openssl -y > /dev/null 2>&1
 elif command -v yum >/dev/null 2>&1; then
     PM="yum"
     yum install epel-release -y > /dev/null 2>&1
-    yum install curl wget sqlite firewalld coreutils iproute -y > /dev/null 2>&1
+    yum install curl wget sqlite firewalld coreutils iproute openssl -y > /dev/null 2>&1
 else
     echo "❌ 严重错误: 不支持的操作系统！请使用 Debian/Ubuntu 或 CentOS/RHEL 体系。"
     exit 1
@@ -114,6 +121,13 @@ export XUI_NONINTERACTIVE=1
 export XUI_USERNAME="$PANEL_USER"
 export XUI_PASSWORD="$PANEL_PASS"
 export XUI_PANEL_PORT="$RANDOM_PANEL_PORT"
+# OPENSSL_ON=0: 使用 x-ui 官方内置的 Let's Encrypt IP 证书流程（acme.sh 签发,
+# 自动续期, 需 80 端口对外可达）; OPENSSL_ON=1: 跳过官方 SSL, 稍后用 openssl 自签
+if [ "$OPENSSL_ON" = "0" ]; then
+    export XUI_SSL_MODE=ip
+else
+    export XUI_SSL_MODE=none
+fi
 bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) < /dev/null
 
 if [ ! -f /usr/local/x-ui/x-ui ]; then
@@ -262,6 +276,53 @@ set_setting "subPath" "/sub/"
 set_setting "subClashEnable" "true"
 set_setting "subJsonEnable" "true"
 
+# 配置面板 HTTPS
+# OPENSSL_ON=0: 证书已由官方安装脚本通过 Let's Encrypt 签发并配置（x-ui cert 命令写入),
+#               这里只做检测确认; OPENSSL_ON=1: 生成 openssl 自签名证书写入设置。
+# 无论哪种方式, 都把面板证书同步给订阅服务, 让订阅链接同样走 https。
+CERT_FILE=$(sqlite3 $DB_PATH "SELECT value FROM settings WHERE key='webCertFile';" | tr -d '" \r\n')
+KEY_FILE=$(sqlite3 $DB_PATH "SELECT value FROM settings WHERE key='webKeyFile';" | tr -d '" \r\n')
+
+if [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ] && [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+    echo "✅ 检测到面板已配置证书，保留现有 HTTPS 配置: $CERT_FILE"
+elif [ "$OPENSSL_ON" = "1" ]; then
+    CERT_DIR="/etc/x-ui/cert"
+    mkdir -p "$CERT_DIR"
+    CERT_FILE="$CERT_DIR/self_signed.crt"
+    KEY_FILE="$CERT_DIR/self_signed.key"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$KEY_FILE" -out "$CERT_FILE" -days 3650 -nodes \
+        -subj "/CN=${PUBLIC_IP}" \
+        -addext "subjectAltName=IP:${PUBLIC_IP}" > /dev/null 2>&1
+    if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+        chmod 600 "$KEY_FILE"
+        echo "✅ 已生成自签名证书 (有效期 10 年): $CERT_FILE"
+    else
+        echo "⚠️  警告: 自签名证书生成失败，面板将保持 HTTP 访问。"
+        CERT_FILE=""
+        KEY_FILE=""
+    fi
+else
+    echo "⚠️  警告: 未检测到面板证书，官方 Let's Encrypt IP 证书可能签发失败"
+    echo "   （常见原因: 80 端口未对外开放、或 NAT 环境公网无法回连本机）。"
+    echo "   面板将保持 HTTP 访问。可放行 80 端口后重跑脚本，"
+    echo "   或改用自签名证书: bash vmess.sh openssl"
+    CERT_FILE=""
+    KEY_FILE=""
+fi
+
+PANEL_SCHEME="http"
+SUB_SCHEME="http"
+if [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ]; then
+    set_setting "webCertFile" "$CERT_FILE"
+    set_setting "webKeyFile" "$KEY_FILE"
+    # 订阅服务使用同一套证书，同样升级为 https
+    set_setting "subCertFile" "$CERT_FILE"
+    set_setting "subKeyFile" "$KEY_FILE"
+    PANEL_SCHEME="https"
+    SUB_SCHEME="https"
+fi
+
 systemctl start x-ui
 sleep 2
 
@@ -295,16 +356,19 @@ if [ "$VLESS_ENABLED" = "1" ]; then
     VLESS_SHARE_LINK="vless://${VLESS_UUID}@${PUBLIC_IP}:${VLESS_PORT}?type=tcp&security=reality&pbk=${REALITY_PUBLIC_KEY}&fp=chrome&sni=${REALITY_SNI}&sid=${REALITY_SHORT_ID}&spx=%2F&flow=xtls-rprx-vision#${VLESS_REMARK}"
 fi
 
-SUB_URL="http://${PUBLIC_IP}:${SUB_PORT}/sub/${SUB_ID}"
-CLASH_SUB_URL="http://${PUBLIC_IP}:${SUB_PORT}/clash/${SUB_ID}"
-JSON_SUB_URL="http://${PUBLIC_IP}:${SUB_PORT}/json/${SUB_ID}"
+SUB_URL="${SUB_SCHEME}://${PUBLIC_IP}:${SUB_PORT}/sub/${SUB_ID}"
+CLASH_SUB_URL="${SUB_SCHEME}://${PUBLIC_IP}:${SUB_PORT}/clash/${SUB_ID}"
+JSON_SUB_URL="${SUB_SCHEME}://${PUBLIC_IP}:${SUB_PORT}/json/${SUB_ID}"
 
 echo ""
 echo "===================================================="
 echo "🎉 部署完成！"
 echo "===================================================="
 echo "🌐 【Web 面板地址】"
-echo "▶ 地址: http://${PUBLIC_IP}:${REAL_PANEL_PORT}${REAL_BASE_PATH}"
+echo "▶ 地址: ${PANEL_SCHEME}://${PUBLIC_IP}:${REAL_PANEL_PORT}${REAL_BASE_PATH}"
+if [ "$PANEL_SCHEME" = "https" ] && [ "$OPENSSL_ON" = "1" ]; then
+    echo "▶ 提示: 自签名证书浏览器会提示不安全，选择\"继续访问\"即可。"
+fi
 echo "▶ 账号: $PANEL_USER"
 echo "▶ 密码: $PANEL_PASS"
 echo "----------------------------------------------------"
@@ -331,8 +395,7 @@ echo "▶ sing-box 用户: 直接导入上方 Base64 通用订阅即可（sing-b
 echo -e "\033[36m$JSON_SUB_URL\033[0m"
 echo "===================================================="
 if [ "$PANEL_USER" = "admin" ] && [ "$PANEL_PASS" = "admin" ]; then
-    echo "⚠️  安全提醒: 面板正在使用默认账号密码 admin/admin 且以 HTTP 明文暴露公网，"
-    echo "   请立即登录面板修改密码，并建议配置 TLS 证书！"
+    echo "⚠️  安全提醒: 面板正在使用默认账号密码 admin/admin 并暴露公网，请立即登录面板修改密码！"
 fi
 
 # 8. 将部署结果写入当前目录的 log 文件（含账号密码，权限设为 600 仅 root 可读）
@@ -362,7 +425,7 @@ cat > "$LOG_FILE" << LOGEOF
 ====================================================
 
 【Web 面板】
-地址: http://${PUBLIC_IP}:${REAL_PANEL_PORT}${REAL_BASE_PATH}
+地址: ${PANEL_SCHEME}://${PUBLIC_IP}:${REAL_PANEL_PORT}${REAL_BASE_PATH}
 账号: ${PANEL_USER}
 密码: ${PANEL_PASS}
 
