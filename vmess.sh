@@ -128,10 +128,35 @@ if [ "$OPENSSL_ON" = "0" ]; then
 else
     export XUI_SSL_MODE=none
 fi
-bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) < /dev/null
 
-if [ ! -f /usr/local/x-ui/x-ui ]; then
-    echo "❌ 严重错误: 3x-ui 安装失败（未找到 /usr/local/x-ui/x-ui），请检查上方输出。"
+# 先把官方安装脚本完整下载到本地再执行（避免 bash <(curl) 下载中断时静默跳过），
+# 整个安装流程最多重试 3 次：GitHub 下载发行包时断流会导致 tar 解压 EOF 报错，
+# 属于瞬时网络问题，重跑通常即可恢复。
+INSTALLER="/tmp/3xui_install.sh"
+INSTALL_OK=0
+for attempt in 1 2 3; do
+    [ "$attempt" -gt 1 ] && echo "⚠️  安装未成功，10 秒后进行第 ${attempt}/3 次尝试..." && sleep 10
+
+    curl -Ls --retry 3 --retry-delay 2 --max-time 120 \
+        -o "$INSTALLER" https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh
+    # 校验下载的确是脚本而非错误页/空文件
+    if [ ! -s "$INSTALLER" ] || ! head -n 1 "$INSTALLER" | grep -q "^#!"; then
+        echo "⚠️  安装脚本下载失败或内容异常。"
+        continue
+    fi
+
+    bash "$INSTALLER" < /dev/null
+
+    if [ -f /usr/local/x-ui/x-ui ]; then
+        INSTALL_OK=1
+        break
+    fi
+done
+
+if [ "$INSTALL_OK" != "1" ]; then
+    echo "❌ 严重错误: 3x-ui 安装失败（已重试 3 次，未找到 /usr/local/x-ui/x-ui）。"
+    echo "   常见原因是服务器访问 GitHub 不稳定导致发行包下载中断，"
+    echo "   请检查上方输出和网络状况后重新运行本脚本。"
     exit 1
 fi
 
@@ -155,14 +180,19 @@ EXTERNAL_IP=$(curl -s --max-time 10 https://api.ipify.org)
 [ -z "$EXTERNAL_IP" ] && EXTERNAL_IP=$(curl -s --max-time 10 ipv4.icanhazip.com)
 EXTERNAL_IP=$(echo "$EXTERNAL_IP" | tr -d ' \r\n')
 
+# 确定链接最终使用的 IP：客户端是从公网连入的，两者不一致（NAT 环境）时
+# 必须用外部探测到的公网 IP，本机 IP 只在探测失败时兜底
+PUBLIC_IP="$LOCAL_IP"
 if [ -z "$EXTERNAL_IP" ]; then
-    echo "⚠️  警告: 无法从外部探测公网 IP（网络受限或探测接口不可用），将直接使用本机 IP: ${LOCAL_IP:-未知}"
-elif [ -n "$LOCAL_IP" ] && [ "$EXTERNAL_IP" != "$LOCAL_IP" ]; then
-    echo "⚠️  警告: 外部探测到的公网 IP ($EXTERNAL_IP) 与本机默认 IP ($LOCAL_IP) 不一致，"
-    echo "   本机可能位于 NAT 之后，最终链接将使用本机 IP: $LOCAL_IP，如无法连接请手动替换为公网 IP。"
+    echo "⚠️  警告: 无法从外部探测公网 IP（网络受限或探测接口不可用），将使用本机 IP: ${LOCAL_IP:-未知}"
+    echo "   如本机 IP 是内网地址，生成的链接无法从外部连接，请手动替换为公网 IP。"
+elif [ "$EXTERNAL_IP" != "$LOCAL_IP" ]; then
+    echo "⚠️  警告: 本机 IP ($LOCAL_IP) 与外部探测公网 IP ($EXTERNAL_IP) 不一致，本机位于 NAT 之后。"
+    echo "   最终链接将使用公网 IP: $EXTERNAL_IP（客户端从公网连入，必须使用公网地址）。"
+    echo "   注意: NAT 环境需在服务商控制台将公网端口转发/放行到本机对应端口。"
+    PUBLIC_IP="$EXTERNAL_IP"
 fi
 
-PUBLIC_IP="$LOCAL_IP"
 if [ -z "$PUBLIC_IP" ]; then
     PUBLIC_IP="YOUR_SERVER_IP"
     REGION="未知_地区"
@@ -206,17 +236,24 @@ SUB_ID=$(cat /proc/sys/kernel/random/uuid | tr -d '-')
 
 # ==================================================================
 # 【默认生效】 VMESS 节点配置注入
-SETTINGS="{\"clients\":[{\"id\":\"$UUID\",\"alterId\":0,\"email\":\"vmess_$UUID\",\"limitIp\":0,\"totalGB\":0,\"expiryTime\":0,\"enable\":true,\"tgId\":\"\",\"subId\":\"$SUB_ID\"}],\"disableInsecureEncryption\":false}"
+# 注意: INSERT 必须包含 allocate 列。新版 3x-ui 缺失该字段时 xray 无法加载
+# 该入站（表现为节点不可用, 需在面板把入站关闭再开启一次才恢复）。
+ALLOCATE='{"strategy":"always","refresh":5,"concurrency":3}'
+# 注意: subId 键必须写成 '"subId": "..."'（冒号后带空格）。3x-ui 订阅服务
+# 按该字符串模式对 settings 做 SQL LIKE 匹配（面板保存的 JSON 即此格式），
+# 紧凑写法会导致订阅查不到节点, 订阅链接 404。
+SETTINGS="{\"clients\":[{\"id\":\"$UUID\",\"alterId\":0,\"email\":\"vmess_$UUID\",\"limitIp\":0,\"totalGB\":0,\"expiryTime\":0,\"enable\":true,\"tgId\":0,\"subId\": \"$SUB_ID\"}],\"disableInsecureEncryption\":false}"
 STREAM_SETTINGS="{\"network\":\"tcp\",\"security\":\"none\",\"tcpSettings\":{\"acceptProxyProtocol\":false,\"header\":{\"type\":\"none\"}}}"
 SNIFFING="{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}"
 
+# （停机状态）清理旧的同名节点，并修复历史部署遗留的格式问题
 sqlite3 $DB_PATH "DELETE FROM inbounds WHERE remark = '$VMESS_REMARK';"
-sqlite3 $DB_PATH "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing) VALUES (1, 0, 0, 0, '$VMESS_REMARK', 1, 0, '', $NODE_PORT, 'vmess', '$SETTINGS', '$STREAM_SETTINGS', 'inbound-$NODE_PORT', '$SNIFFING');"
-
-INBOUND_COUNT=$(sqlite3 $DB_PATH "SELECT COUNT(*) FROM inbounds WHERE port = $NODE_PORT;")
-if [ "$INBOUND_COUNT" != "1" ]; then
-    echo "❌ 严重错误: 节点写入数据库失败，请手动登录面板添加节点。"
-fi
+# 补齐历史节点缺失的 allocate 字段（缺失会导致 xray 首次加载失败）
+sqlite3 $DB_PATH "UPDATE inbounds SET allocate='$ALLOCATE' WHERE allocate IS NULL OR allocate='';" 2>/dev/null
+# 归一化 subId 格式: 旧版订阅服务按 '"subId": "' 带空格模式匹配
+sqlite3 $DB_PATH "UPDATE inbounds SET settings = REPLACE(settings, '\"subId\":\"', '\"subId\": \"');"
+# 修复历史节点的 tgId 类型: 新版要求整数, 空字符串会导致面板解析 settings 失败
+sqlite3 $DB_PATH "UPDATE inbounds SET settings = REPLACE(settings, '\"tgId\":\"\"', '\"tgId\":0');"
 
 # ==================================================================
 # 【可选】 VLESS + Reality 节点配置注入（由 VLESS_ON 变量或 vless 参数控制）
@@ -244,17 +281,10 @@ if [ -z "$REALITY_PRIVATE_KEY" ] || [ -z "$REALITY_PUBLIC_KEY" ]; then
     VLESS_ENABLED=0
 else
     VLESS_ENABLED=1
-    VLESS_SETTINGS="{\"clients\":[{\"id\":\"$VLESS_UUID\",\"flow\":\"xtls-rprx-vision\",\"email\":\"vless_$VLESS_UUID\",\"limitIp\":0,\"totalGB\":0,\"expiryTime\":0,\"enable\":true,\"tgId\":\"\",\"subId\":\"$SUB_ID\"}],\"decryption\":\"none\",\"fallbacks\":[]}"
+    VLESS_SETTINGS="{\"clients\":[{\"id\":\"$VLESS_UUID\",\"flow\":\"xtls-rprx-vision\",\"email\":\"vless_$VLESS_UUID\",\"limitIp\":0,\"totalGB\":0,\"expiryTime\":0,\"enable\":true,\"tgId\":0,\"subId\": \"$SUB_ID\"}],\"decryption\":\"none\",\"fallbacks\":[]}"
     VLESS_STREAM_SETTINGS="{\"network\":\"tcp\",\"security\":\"reality\",\"externalProxy\":[],\"realitySettings\":{\"show\":false,\"xver\":0,\"dest\":\"$REALITY_DEST\",\"serverNames\":[\"$REALITY_SNI\"],\"privateKey\":\"$REALITY_PRIVATE_KEY\",\"minClient\":\"\",\"maxClient\":\"\",\"maxTimediff\":0,\"shortIds\":[\"$REALITY_SHORT_ID\"],\"settings\":{\"publicKey\":\"$REALITY_PUBLIC_KEY\",\"fingerprint\":\"chrome\",\"serverName\":\"\",\"spiderX\":\"/\"}},\"tcpSettings\":{\"acceptProxyProtocol\":false,\"header\":{\"type\":\"none\"}}}"
 
     sqlite3 $DB_PATH "DELETE FROM inbounds WHERE remark = '$VLESS_REMARK';"
-    sqlite3 $DB_PATH "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing) VALUES (1, 0, 0, 0, '$VLESS_REMARK', 1, 0, '', $VLESS_PORT, 'vless', '$VLESS_SETTINGS', '$VLESS_STREAM_SETTINGS', 'inbound-$VLESS_PORT', '$SNIFFING');"
-
-    VLESS_COUNT=$(sqlite3 $DB_PATH "SELECT COUNT(*) FROM inbounds WHERE port = $VLESS_PORT;")
-    if [ "$VLESS_COUNT" != "1" ]; then
-        echo "❌ 严重错误: VLESS 节点写入数据库失败，请手动登录面板添加节点。"
-        VLESS_ENABLED=0
-    fi
 fi
 fi
 # ==================================================================
@@ -269,12 +299,20 @@ set_setting() {
     fi
 }
 set_setting "subEnable" "true"
+set_setting "subListen" ""
 set_setting "subPort" "$SUB_PORT"
 set_setting "subPath" "/sub/"
-# 启用 Clash(Mihomo) 与 Xray-JSON 订阅格式（3x-ui 原生支持，默认关闭）
-# Clash 订阅路径 /clash/ -> YAML；JSON 订阅路径 /json/ -> Xray 客户端完整配置
-set_setting "subClashEnable" "true"
-set_setting "subJsonEnable" "true"
+# 关闭订阅加密：新版 3x-ui 开启该项后订阅 URL 使用加密 token 而非裸 subId，
+# 脚本按 subId 拼出的链接会 404。该键不写时走程序默认值，必须显式关闭。
+set_setting "subEncrypt" "false"
+# Xray-JSON 订阅路径（3x-ui 内置端点，订阅开启后即生效，无需单独开关）
+set_setting "subJsonPath" "/json/"
+# 清空可能由之前手动配置残留的域名/URI 覆盖项，防止生成的链接与实际监听不一致
+set_setting "subDomain" ""
+set_setting "subURI" ""
+set_setting "subJsonURI" ""
+# 清理旧版脚本写入的无效键（3x-ui 不存在这两个设置，Clash 订阅并非原生功能）
+sqlite3 $DB_PATH "DELETE FROM settings WHERE key IN ('subClashEnable','subJsonEnable');"
 
 # 配置面板 HTTPS
 # OPENSSL_ON=0: 证书已由官方安装脚本通过 Let's Encrypt 签发并配置（x-ui cert 命令写入),
@@ -324,7 +362,121 @@ if [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ]; then
 fi
 
 systemctl start x-ui
-sleep 2
+
+# ==================================================================
+# 通过面板官方 API 注入节点（与网页添加入站走同一接口）
+# 面板会自行完成: 字段校验、clients/client_inbounds/client_traffics 等
+# 关联表写入、xray 配置重建与热加载。直写数据库需要手工模拟这一切，
+# 且面板版本升级改表结构后必然失效（订阅 404、客户端创建报错均源于此）。
+# ==================================================================
+API_PORT=$(sqlite3 $DB_PATH "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" | tr -d '" \r\n')
+API_PORT=${API_PORT:-$RANDOM_PANEL_PORT}
+API_BASE_PATH=$(sqlite3 $DB_PATH "SELECT value FROM settings WHERE key='webBasePath';" | tr -d '" \r\n')
+[ -z "$API_BASE_PATH" ] && API_BASE_PATH="/"
+case "$API_BASE_PATH" in /*) ;; *) API_BASE_PATH="/$API_BASE_PATH" ;; esac
+case "$API_BASE_PATH" in */) ;; *) API_BASE_PATH="$API_BASE_PATH/" ;; esac
+API_BASE="${PANEL_SCHEME}://127.0.0.1:${API_PORT}${API_BASE_PATH}"
+
+# 等待面板 Web 服务就绪（最多 30 秒）
+PANEL_READY=0
+for i in $(seq 1 30); do
+    if curl -sk --max-time 2 -o /dev/null "${API_BASE}login"; then
+        PANEL_READY=1
+        break
+    fi
+    sleep 1
+done
+[ "$PANEL_READY" != "1" ] && echo "⚠️  警告: 面板 Web 服务 30 秒内未就绪，API 注入可能失败。"
+
+# settings/streamSettings/sniffing/allocate 需以 JSON 字符串形式嵌入请求体
+json_escape() {
+    echo -n "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+COOKIE_JAR=$(mktemp)
+API_OK=0
+LOGIN_RES=$(curl -sk --max-time 15 -c "$COOKIE_JAR" -X POST "${API_BASE}login" \
+    --data-urlencode "username=${PANEL_USER}" --data-urlencode "password=${PANEL_PASS}")
+if echo "$LOGIN_RES" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
+    API_OK=1
+    echo "✅ 面板 API 登录成功"
+else
+    echo "⚠️  警告: 面板 API 登录失败，将回退为数据库方式注入。返回: $(echo "$LOGIN_RES" | head -c 200)"
+fi
+
+add_inbound_api() {
+    local remark=$1 port=$2 protocol=$3 settings=$4 stream=$5
+    curl -sk --max-time 20 -b "$COOKIE_JAR" -H "Content-Type: application/json" \
+        -X POST "${API_BASE}panel/api/inbounds/add" \
+        -d "{\"up\":0,\"down\":0,\"total\":0,\"remark\":\"$remark\",\"enable\":true,\"expiryTime\":0,\"listen\":\"\",\"port\":$port,\"protocol\":\"$protocol\",\"settings\":\"$(json_escape "$settings")\",\"streamSettings\":\"$(json_escape "$stream")\",\"sniffing\":\"$(json_escape "$SNIFFING")\",\"allocate\":\"$(json_escape "$ALLOCATE")\"}"
+}
+
+# SQL 兜底: 仅在 API 不可用时使用。写入 inbounds 后尽力补齐新版 clients 相关表
+# （新版订阅服务从 clients.sub_id 查订阅，缺行则订阅 404）
+add_inbound_sql() {
+    local remark=$1 port=$2 protocol=$3 settings=$4 stream=$5 email=$6 uuid=$7 flow=$8
+    sqlite3 $DB_PATH "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate) VALUES (1, 0, 0, 0, '$remark', 1, 0, '', $port, '$protocol', '$settings', '$stream', 'inbound-$port', '$SNIFFING', '$ALLOCATE');"
+    local inbound_id
+    inbound_id=$(sqlite3 $DB_PATH "SELECT id FROM inbounds WHERE port = $port LIMIT 1;")
+    # 以下表仅新版存在，旧版报错忽略即可
+    if [ -n "$inbound_id" ]; then
+        local now_ms=$(( $(date +%s) * 1000 ))
+        sqlite3 $DB_PATH "INSERT INTO clients (email, sub_id, uuid, flow, enable, limit_ip, total_gb, expiry_time, tg_id, reset, created_at, updated_at) VALUES ('$email', '$SUB_ID', '$uuid', '$flow', 1, 0, 0, 0, 0, 0, $now_ms, $now_ms);" 2>/dev/null
+        local client_id
+        client_id=$(sqlite3 $DB_PATH "SELECT id FROM clients WHERE email = '$email' LIMIT 1;" 2>/dev/null)
+        [ -n "$client_id" ] && sqlite3 $DB_PATH "INSERT INTO client_inbounds (client_id, inbound_id) VALUES ($client_id, $inbound_id);" 2>/dev/null
+        sqlite3 $DB_PATH "INSERT INTO client_traffics (inbound_id, enable, email, up, down, expiry_time, total, reset) VALUES ($inbound_id, 1, '$email', 0, 0, 0, 0, 0);" 2>/dev/null
+    fi
+}
+
+NEED_RESTART=0
+inject_inbound() {
+    local remark=$1 port=$2 protocol=$3 settings=$4 stream=$5 email=$6 uuid=$7 flow=$8 res=""
+    if [ "$API_OK" = "1" ]; then
+        res=$(add_inbound_api "$remark" "$port" "$protocol" "$settings" "$stream")
+        if echo "$res" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
+            echo "✅ 节点注入成功 (面板 API): $remark"
+            return 0
+        fi
+        echo "⚠️  警告: API 注入失败 ($remark)，改用数据库兜底。返回: $(echo "$res" | head -c 200)"
+    fi
+    add_inbound_sql "$remark" "$port" "$protocol" "$settings" "$stream" "$email" "$uuid" "$flow"
+    if [ "$(sqlite3 $DB_PATH "SELECT COUNT(*) FROM inbounds WHERE port = $port;")" = "1" ]; then
+        echo "✅ 节点注入成功 (数据库兜底): $remark"
+        NEED_RESTART=1
+        return 0
+    fi
+    echo "❌ 严重错误: 节点注入失败 ($remark)，请手动登录面板添加节点。"
+    return 1
+}
+
+inject_inbound "$VMESS_REMARK" "$NODE_PORT" "vmess" "$SETTINGS" "$STREAM_SETTINGS" "vmess_$UUID" "$UUID" ""
+VMESS_INJECTED=$?
+if [ "$VLESS_ENABLED" = "1" ]; then
+    inject_inbound "$VLESS_REMARK" "$VLESS_PORT" "vless" "$VLESS_SETTINGS" "$VLESS_STREAM_SETTINGS" "vless_$VLESS_UUID" "$VLESS_UUID" "xtls-rprx-vision" || VLESS_ENABLED=0
+fi
+rm -f "$COOKIE_JAR"
+
+# 数据库兜底写入过时必须重启面板才会加载; API 注入面板已热加载，重启一次作保险
+systemctl restart x-ui
+sleep 5
+
+# 节点自检：确认 xray 已在节点端口监听（节点能否使用的直接判据）。
+# 未监听则再重启一次并复查，仍失败才提示人工介入。
+node_port_listening() {
+    ss -tln 2>/dev/null | awk '{print $4}' | grep -q ":${NODE_PORT}\$"
+}
+if ! node_port_listening; then
+    echo "⚠️  节点端口 ${NODE_PORT} 暂未监听，正在重启 x-ui 重试..."
+    systemctl restart x-ui
+    sleep 5
+fi
+if node_port_listening; then
+    echo "✅ 节点自检通过: xray 已在端口 ${NODE_PORT} 监听"
+else
+    echo "❌ 严重错误: 节点端口 ${NODE_PORT} 未在监听，xray 未正确加载节点配置！"
+    echo "   请登录面板将该入站关闭再开启一次，或执行 journalctl -u x-ui -n 50 查看错误日志。"
+fi
 
 # 7. 读取真实配置及二次确认
 echo -e "\n[7/7] 正在校验最终配置与环境..."
@@ -357,8 +509,22 @@ if [ "$VLESS_ENABLED" = "1" ]; then
 fi
 
 SUB_URL="${SUB_SCHEME}://${PUBLIC_IP}:${SUB_PORT}/sub/${SUB_ID}"
-CLASH_SUB_URL="${SUB_SCHEME}://${PUBLIC_IP}:${SUB_PORT}/clash/${SUB_ID}"
 JSON_SUB_URL="${SUB_SCHEME}://${PUBLIC_IP}:${SUB_PORT}/json/${SUB_ID}"
+
+# 本机自检订阅服务：确认端口在监听且 URL 返回 200
+sleep 2
+SUB_HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "${SUB_SCHEME}://127.0.0.1:${SUB_PORT}/sub/${SUB_ID}")
+if [ "$SUB_HTTP_CODE" = "200" ]; then
+    echo "✅ 订阅服务自检通过 (端口 ${SUB_PORT})"
+else
+    echo "⚠️  警告: 订阅服务本机自检失败 (HTTP ${SUB_HTTP_CODE:-无响应})。"
+    if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -q ":${SUB_PORT}\$"; then
+        echo "   订阅端口 ${SUB_PORT} 未在监听——x-ui 可能未正确加载订阅配置，"
+        echo "   请执行 systemctl restart x-ui 后重试订阅链接。"
+    else
+        echo "   端口在监听但返回异常，请登录面板检查 订阅设置。"
+    fi
+fi
 
 echo ""
 echo "===================================================="
@@ -385,9 +551,8 @@ fi
 echo "📡 【通用订阅链接 (Base64, 通用客户端)】"
 echo -e "\033[36m$SUB_URL\033[0m"
 echo "----------------------------------------------------"
-echo "📡 【Clash / Mihomo 订阅链接 (YAML)】"
-echo "▶ 适用于: Clash Verge / Clash Meta / Mihomo / Stash 等"
-echo -e "\033[36m$CLASH_SUB_URL\033[0m"
+echo "📡 【Clash / Mihomo 用户】"
+echo "▶ Clash Verge / Clash Meta / Mihomo 均支持直接导入上方 Base64 通用订阅"
 echo "----------------------------------------------------"
 echo "📡 【Xray JSON 订阅链接】"
 echo "▶ 适用于: v2rayN / v2rayNG 等支持 Xray-JSON 订阅的客户端"
@@ -436,14 +601,11 @@ UUID: ${UUID}
 ${SHARE_LINK}
 ${VLESS_LOG_BLOCK}
 【v2ray 通用订阅 (Base64)】
-
-【v2ray 通用订阅 (Base64)】
 适用于: v2rayN / v2rayNG / NekoBox 等通用客户端
 ${SUB_URL}
 
-【Clash / Mihomo 订阅 (YAML)】
-适用于: Clash Verge / Clash Meta / Mihomo / Stash 等
-${CLASH_SUB_URL}
+【Clash / Mihomo】
+Clash Verge / Clash Meta / Mihomo / Stash 支持直接导入上方 Base64 通用订阅
 
 【sing-box 订阅】
 sing-box 支持解析分享链接，直接导入 Base64 通用订阅即可:
