@@ -14,6 +14,15 @@ VLESS_ON=0
 # 面板 HTTPS 证书方式: 0=使用 x-ui 官方 Let's Encrypt IP 证书(默认, 自动续期, 需 80 端口可达),
 #                      1=使用 openssl 自签名证书(浏览器会告警, 适合 80 端口被占/受限的环境)
 OPENSSL_ON=0
+
+# 3x-ui 面板端口, 0=随机端口号
+PANEL_PORT=38438
+
+# 3x-ui 订阅服务端口
+SUB_PORT=2096
+
+# 3x-ui 面板路径， empty=默认路径
+PANEL_PATH="xui"
 # ==================================================================
 
 # 解析命令行参数
@@ -47,11 +56,22 @@ pick_free_port() {
     echo "$((base + RANDOM % 10000))"
 }
 
-RANDOM_PANEL_PORT=$(pick_free_port 40000)
+if [ "$PANEL_PORT" = "0" ] || [ -z "$PANEL_PORT" ]; then
+    RANDOM_PANEL_PORT=$(pick_free_port 40000)
+else
+    if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -q ":${PANEL_PORT}\$"; then
+        RANDOM_PANEL_PORT=$PANEL_PORT
+    else
+        echo "⚠️  指定的面板端口 $PANEL_PORT 已被占用，将使用随机端口..."
+        RANDOM_PANEL_PORT=$(pick_free_port 40000)
+    fi
+fi
+
+
 NODE_PORT=$(pick_free_port 50000)
 VLESS_PORT=""
 [ "$VLESS_ON" = "1" ] && VLESS_PORT=$(pick_free_port 30000)   # VLESS+Reality 节点端口
-SUB_PORT=2096   # 3x-ui 订阅服务端口
+
 
 echo "===================================================="
 echo "🚀 正在全自动安装 3x-ui 并智能配置初始环境..."
@@ -319,6 +339,12 @@ set_setting "subClashEnable" "true"
 # 启用 JSON 订阅（适用于 sing-box 等客户端）
 set_setting "subJsonEnable" "true"
 
+# 配置自定义面板路径 (如果未配置，则由 3x-ui 自身生成默认路径)
+if [ -n "$PANEL_PATH" ]; then
+    CLEAN_PATH=$(echo "$PANEL_PATH" | sed 's/^\/*//; s/\/*$//')
+    set_setting "webBasePath" "/${CLEAN_PATH}/"
+fi
+
 # 配置面板 HTTPS
 # OPENSSL_ON=0: 证书已由官方安装脚本通过 Let's Encrypt 签发并配置（x-ui cert 命令写入),
 #               这里只做检测确认; OPENSSL_ON=1: 生成 openssl 自签名证书写入设置。
@@ -380,6 +406,8 @@ API_BASE_PATH=$(sqlite3 $DB_PATH "SELECT value FROM settings WHERE key='webBaseP
 [ -z "$API_BASE_PATH" ] && API_BASE_PATH="/"
 case "$API_BASE_PATH" in /*) ;; *) API_BASE_PATH="/$API_BASE_PATH" ;; esac
 case "$API_BASE_PATH" in */) ;; *) API_BASE_PATH="$API_BASE_PATH/" ;; esac
+# 去除多余的双斜杠，防止由于异常数据拼出 //login 这样的异常 URL
+API_BASE_PATH=$(echo "$API_BASE_PATH" | sed 's/\/\/*/\//g')
 API_BASE="${PANEL_SCHEME}://127.0.0.1:${API_PORT}${API_BASE_PATH}"
 
 # 等待面板 Web 服务就绪（最多 30 秒，以能拿到 HTTP 状态码为准）
