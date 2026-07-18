@@ -307,12 +307,17 @@ set_setting "subPath" "/sub/"
 set_setting "subEncrypt" "false"
 # Xray-JSON 订阅路径（3x-ui 内置端点，订阅开启后即生效，无需单独开关）
 set_setting "subJsonPath" "/json/"
+# Clash/Mihomo 订阅路径
+set_setting "subClashPath" "/clash/"
 # 清空可能由之前手动配置残留的域名/URI 覆盖项，防止生成的链接与实际监听不一致
 set_setting "subDomain" ""
 set_setting "subURI" ""
 set_setting "subJsonURI" ""
-# 清理旧版脚本写入的无效键（3x-ui 不存在这两个设置，Clash 订阅并非原生功能）
-sqlite3 $DB_PATH "DELETE FROM settings WHERE key IN ('subClashEnable','subJsonEnable');"
+set_setting "subClashURI" ""
+# 启用 Clash/Mihomo 订阅（3x-ui v2.4.5+ 原生支持，面板默认关闭，必须显式开启）
+set_setting "subClashEnable" "true"
+# 启用 JSON 订阅（适用于 sing-box 等客户端）
+set_setting "subJsonEnable" "true"
 
 # 配置面板 HTTPS
 # OPENSSL_ON=0: 证书已由官方安装脚本通过 Let's Encrypt 签发并配置（x-ui cert 命令写入),
@@ -377,10 +382,11 @@ case "$API_BASE_PATH" in /*) ;; *) API_BASE_PATH="/$API_BASE_PATH" ;; esac
 case "$API_BASE_PATH" in */) ;; *) API_BASE_PATH="$API_BASE_PATH/" ;; esac
 API_BASE="${PANEL_SCHEME}://127.0.0.1:${API_PORT}${API_BASE_PATH}"
 
-# 等待面板 Web 服务就绪（最多 30 秒）
+# 等待面板 Web 服务就绪（最多 30 秒，以能拿到 HTTP 状态码为准）
 PANEL_READY=0
 for i in $(seq 1 30); do
-    if curl -sk --max-time 2 -o /dev/null "${API_BASE}login"; then
+    READY_CODE=$(curl -sk --max-time 2 -o /dev/null -w "%{http_code}" "${API_BASE}login")
+    if [ -n "$READY_CODE" ] && [ "$READY_CODE" != "000" ]; then
         PANEL_READY=1
         break
     fi
@@ -393,15 +399,24 @@ json_escape() {
     echo -n "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# 登录重试 5 次: 面板刚启动时首个请求可能超时/空响应, 失败时输出状态码便于诊断
 COOKIE_JAR=$(mktemp)
 API_OK=0
-LOGIN_RES=$(curl -sk --max-time 15 -c "$COOKIE_JAR" -X POST "${API_BASE}login" \
-    --data-urlencode "username=${PANEL_USER}" --data-urlencode "password=${PANEL_PASS}")
-if echo "$LOGIN_RES" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
-    API_OK=1
-    echo "✅ 面板 API 登录成功"
-else
-    echo "⚠️  警告: 面板 API 登录失败，将回退为数据库方式注入。返回: $(echo "$LOGIN_RES" | head -c 200)"
+for i in $(seq 1 5); do
+    LOGIN_RES=$(curl -sk -L --max-time 15 -c "$COOKIE_JAR" \
+        -w "\nHTTP_CODE:%{http_code}" -X POST "${API_BASE}login" \
+        --data-urlencode "username=${PANEL_USER}" --data-urlencode "password=${PANEL_PASS}")
+    LOGIN_CODE=$(echo "$LOGIN_RES" | sed -n 's/^HTTP_CODE://p')
+    if echo "$LOGIN_RES" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
+        API_OK=1
+        echo "✅ 面板 API 登录成功"
+        break
+    fi
+    [ "$i" -lt 5 ] && sleep 3
+done
+if [ "$API_OK" != "1" ]; then
+    echo "⚠️  警告: 面板 API 登录失败（已重试 5 次, 最后状态码: ${LOGIN_CODE:-无}），将回退为数据库方式注入。"
+    echo "   返回内容: $(echo "$LOGIN_RES" | head -c 200)"
 fi
 
 add_inbound_api() {
@@ -411,11 +426,22 @@ add_inbound_api() {
         -d "{\"up\":0,\"down\":0,\"total\":0,\"remark\":\"$remark\",\"enable\":true,\"expiryTime\":0,\"listen\":\"\",\"port\":$port,\"protocol\":\"$protocol\",\"settings\":\"$(json_escape "$settings")\",\"streamSettings\":\"$(json_escape "$stream")\",\"sniffing\":\"$(json_escape "$SNIFFING")\",\"allocate\":\"$(json_escape "$ALLOCATE")\"}"
 }
 
-# SQL 兜底: 仅在 API 不可用时使用。写入 inbounds 后尽力补齐新版 clients 相关表
-# （新版订阅服务从 clients.sub_id 查订阅，缺行则订阅 404）
+# SQL 兜底: 仅在 API 不可用时使用。inbounds 的列因版本而异（如 allocate 列
+# 仅部分版本存在），先探测实际表结构再拼 INSERT，避免"no column named"错误。
+# 写入后尽力补齐新版 clients 相关表（新版订阅按 clients.sub_id 查询，缺行则 404）
+inbound_has_column() {
+    sqlite3 $DB_PATH "PRAGMA table_info(inbounds);" | awk -F'|' '{print $2}' | grep -qx "$1"
+}
+
 add_inbound_sql() {
     local remark=$1 port=$2 protocol=$3 settings=$4 stream=$5 email=$6 uuid=$7 flow=$8
-    sqlite3 $DB_PATH "INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate) VALUES (1, 0, 0, 0, '$remark', 1, 0, '', $port, '$protocol', '$settings', '$stream', 'inbound-$port', '$SNIFFING', '$ALLOCATE');"
+    local cols="user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing"
+    local vals="1, 0, 0, 0, '$remark', 1, 0, '', $port, '$protocol', '$settings', '$stream', 'inbound-$port', '$SNIFFING'"
+    if inbound_has_column "allocate"; then
+        cols="$cols, allocate"
+        vals="$vals, '$ALLOCATE'"
+    fi
+    sqlite3 $DB_PATH "INSERT INTO inbounds ($cols) VALUES ($vals);"
     local inbound_id
     inbound_id=$(sqlite3 $DB_PATH "SELECT id FROM inbounds WHERE port = $port LIMIT 1;")
     # 以下表仅新版存在，旧版报错忽略即可
@@ -509,21 +535,36 @@ if [ "$VLESS_ENABLED" = "1" ]; then
 fi
 
 SUB_URL="${SUB_SCHEME}://${PUBLIC_IP}:${SUB_PORT}/sub/${SUB_ID}"
+CLASH_SUB_URL="${SUB_SCHEME}://${PUBLIC_IP}:${SUB_PORT}/clash/${SUB_ID}"
 JSON_SUB_URL="${SUB_SCHEME}://${PUBLIC_IP}:${SUB_PORT}/json/${SUB_ID}"
 
 # 本机自检订阅服务：确认端口在监听且 URL 返回 200
 sleep 2
 SUB_HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "${SUB_SCHEME}://127.0.0.1:${SUB_PORT}/sub/${SUB_ID}")
 if [ "$SUB_HTTP_CODE" = "200" ]; then
-    echo "✅ 订阅服务自检通过 (端口 ${SUB_PORT})"
+    echo "✅ Base64 订阅自检通过 (端口 ${SUB_PORT})"
 else
-    echo "⚠️  警告: 订阅服务本机自检失败 (HTTP ${SUB_HTTP_CODE:-无响应})。"
+    echo "⚠️  警告: Base64 订阅本机自检失败 (HTTP ${SUB_HTTP_CODE:-无响应})。"
     if ! ss -tln 2>/dev/null | awk '{print $4}' | grep -q ":${SUB_PORT}\$"; then
         echo "   订阅端口 ${SUB_PORT} 未在监听——x-ui 可能未正确加载订阅配置，"
         echo "   请执行 systemctl restart x-ui 后重试订阅链接。"
     else
         echo "   端口在监听但返回异常，请登录面板检查 订阅设置。"
     fi
+fi
+# Clash/Mihomo 订阅自检
+CLASH_HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "${SUB_SCHEME}://127.0.0.1:${SUB_PORT}/clash/${SUB_ID}")
+if [ "$CLASH_HTTP_CODE" = "200" ]; then
+    echo "✅ Clash/Mihomo 订阅自检通过"
+else
+    echo "⚠️  警告: Clash/Mihomo 订阅自检失败 (HTTP ${CLASH_HTTP_CODE:-无响应})，请登录面板确认 Clash 订阅已开启。"
+fi
+# JSON 订阅自检
+JSON_HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "${SUB_SCHEME}://127.0.0.1:${SUB_PORT}/json/${SUB_ID}")
+if [ "$JSON_HTTP_CODE" = "200" ]; then
+    echo "✅ JSON 订阅自检通过 (sing-box / v2rayN)"
+else
+    echo "⚠️  警告: JSON 订阅自检失败 (HTTP ${JSON_HTTP_CODE:-无响应})，请登录面板确认 JSON 订阅已开启。"
 fi
 
 echo ""
@@ -551,12 +592,13 @@ fi
 echo "📡 【通用订阅链接 (Base64, 通用客户端)】"
 echo -e "\033[36m$SUB_URL\033[0m"
 echo "----------------------------------------------------"
-echo "📡 【Clash / Mihomo 用户】"
-echo "▶ Clash Verge / Clash Meta / Mihomo 均支持直接导入上方 Base64 通用订阅"
+echo "📡 【Clash / Mihomo 订阅链接 (YAML)】"
+echo "▶ 适用于: Clash Verge / Clash Meta / Mihomo / Stash"
+echo -e "\033[36m$CLASH_SUB_URL\033[0m"
 echo "----------------------------------------------------"
 echo "📡 【Xray JSON 订阅链接】"
 echo "▶ 适用于: v2rayN / v2rayNG 等支持 Xray-JSON 订阅的客户端"
-echo "▶ sing-box 用户: 直接导入上方 Base64 通用订阅即可（sing-box 支持解析分享链接）"
+echo "▶ sing-box 用户: 推荐使用此 JSON 订阅链接"
 echo -e "\033[36m$JSON_SUB_URL\033[0m"
 echo "===================================================="
 if [ "$PANEL_USER" = "admin" ] && [ "$PANEL_PASS" = "admin" ]; then
@@ -604,15 +646,12 @@ ${VLESS_LOG_BLOCK}
 适用于: v2rayN / v2rayNG / NekoBox 等通用客户端
 ${SUB_URL}
 
-【Clash / Mihomo】
-Clash Verge / Clash Meta / Mihomo / Stash 支持直接导入上方 Base64 通用订阅
+【Clash / Mihomo 订阅 (YAML)】
+适用于: Clash Verge / Clash Meta / Mihomo / Stash
+${CLASH_SUB_URL}
 
-【sing-box 订阅】
-sing-box 支持解析分享链接，直接导入 Base64 通用订阅即可:
-${SUB_URL}
-
-【Xray JSON 订阅】
-适用于: v2rayN / v2rayNG 等支持 Xray-JSON 订阅的客户端
+【sing-box / Xray JSON 订阅】
+适用于: sing-box (推荐) / v2rayN / v2rayNG
 ${JSON_SUB_URL}
 
 ====================================================
