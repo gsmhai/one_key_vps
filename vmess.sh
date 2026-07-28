@@ -23,6 +23,14 @@ SUB_PORT=2096
 
 # 3x-ui 面板路径， empty=默认路径
 PANEL_PATH="xui"
+
+# 是否验证面板登录: 0=不验证, 1=验证（默认）
+CHECK_PANEL_MODE=1
+
+# 节点注入方式: 0=直接使用数据库方式
+#               1=在 CHECK_PANEL_MODE=1 且登录成功时优先使用面板 API；
+#                 未验证、登录失败或 API 注入失败时自动使用数据库兜底
+INBOUND_MODE=1
 # ==================================================================
 
 # 解析命令行参数
@@ -36,6 +44,10 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# 校验模式参数，防止拼写错误导致走入意外分支
+case "$CHECK_PANEL_MODE" in 0|1) ;; *) echo "❌ 严重错误: CHECK_PANEL_MODE 只能是 0 或 1"; exit 1 ;; esac
+case "$INBOUND_MODE" in 0|1) ;; *) echo "❌ 严重错误: INBOUND_MODE 只能是 0 或 1"; exit 1 ;; esac
 
 # 必须以 root 运行（安装依赖、写 /etc/x-ui、配置防火墙都需要 root）
 if [ "$(id -u)" -ne 0 ]; then
@@ -311,11 +323,14 @@ fi
 
 # 启用订阅服务（3x-ui 默认关闭订阅，不开启的话订阅链接无法访问）
 set_setting() {
-    local key=$1 val=$2
-    if [ -n "$(sqlite3 $DB_PATH "SELECT id FROM settings WHERE key='$key';")" ]; then
-        sqlite3 $DB_PATH "UPDATE settings SET value='$val' WHERE key='$key';"
+    local key=$1 val=$2 key_sql val_sql
+    # SQLite 字符串中的单引号需写成两个单引号，兼容用户自定义备注模板等内容。
+    key_sql=$(echo "$key" | sed "s/'/''/g")
+    val_sql=$(echo "$val" | sed "s/'/''/g")
+    if [ -n "$(sqlite3 "$DB_PATH" "SELECT id FROM settings WHERE key='$key_sql';")" ]; then
+        sqlite3 "$DB_PATH" "UPDATE settings SET value='$val_sql' WHERE key='$key_sql';"
     else
-        sqlite3 $DB_PATH "INSERT INTO settings (key, value) VALUES ('$key', '$val');"
+        sqlite3 "$DB_PATH" "INSERT INTO settings (key, value) VALUES ('$key_sql', '$val_sql');"
     fi
 }
 set_setting "subEnable" "true"
@@ -338,6 +353,38 @@ set_setting "subClashURI" ""
 set_setting "subClashEnable" "true"
 # 启用 JSON 订阅（适用于 sing-box 等客户端）
 set_setting "subJsonEnable" "true"
+
+# 设置订阅备注模板
+# 仅当 settings 表中确实存在 remarkTemplate 且值非空时客户端 EMAIL/USERNAME 所在部分。
+REMARK_TEMPLATE_ID=$(sqlite3 "$DB_PATH" "SELECT id FROM settings WHERE key='remarkTemplate' LIMIT 1;")
+CURRENT_REMARK_TEMPLATE=$(sqlite3 "$DB_PATH" "SELECT value FROM settings WHERE key='remarkTemplate' LIMIT 1;")
+if [ -n "$REMARK_TEMPLATE_ID" ] && [ -n "$CURRENT_REMARK_TEMPLATE" ]; then
+    # 按竖线拆分模板；移除 {{EMAIL}} / {{USERNAME}}，并清理其两侧用于连接名称的 - 或 _。
+    # 流量、剩余天数以及用户自定义的其他模板段均保留。
+    REMARK_TEMPLATE_NO_EMAIL=$(echo "$CURRENT_REMARK_TEMPLATE" | awk -F'|' '
+BEGIN { OFS="|" }
+{
+    out=""
+    for (i=1; i<=NF; i++) {
+        seg=$i
+        gsub(/\{\{(EMAIL|USERNAME)\}\}/, "", seg)
+        gsub(/\{(EMAIL|USERNAME)\}/, "", seg)
+        gsub(/[[:space:]]+/, " ", seg)
+        sub(/[-_[:space:]]+$/, "", seg)
+        sub(/^[-_[:space:]]+/, "", seg)
+        if (seg != "") out = (out == "" ? seg : out OFS seg)
+    }
+    print out
+}')
+    if [ -n "$REMARK_TEMPLATE_NO_EMAIL" ]; then
+        set_setting "remarkTemplate" "$REMARK_TEMPLATE_NO_EMAIL"
+        echo "✅ 订阅节点名称模板已移除 EMAIL/USERNAME: $REMARK_TEMPLATE_NO_EMAIL"
+    else
+        echo "⚠️  警告: 移除 EMAIL/USERNAME 后订阅备注模板为空，已保留数据库原值。"
+    fi
+else
+    echo "ℹ️  数据库中未找到有效的 remarkTemplate，跳过订阅备注模板修改。"
+fi
 
 # 配置自定义面板路径 (如果未配置，则由 3x-ui 自身生成默认路径)
 if [ -n "$PANEL_PATH" ]; then
@@ -398,7 +445,6 @@ systemctl start x-ui
 # 通过面板官方 API 注入节点（与网页添加入站走同一接口）
 # 面板会自行完成: 字段校验、clients/client_inbounds/client_traffics 等
 # 关联表写入、xray 配置重建与热加载。直写数据库需要手工模拟这一切，
-# 且面板版本升级改表结构后必然失效（订阅 404、客户端创建报错均源于此）。
 # ==================================================================
 API_PORT=$(sqlite3 $DB_PATH "SELECT value FROM settings WHERE key='webPort' LIMIT 1;" | tr -d '" \r\n')
 API_PORT=${API_PORT:-$RANDOM_PANEL_PORT}
@@ -410,9 +456,9 @@ case "$API_BASE_PATH" in */) ;; *) API_BASE_PATH="$API_BASE_PATH/" ;; esac
 API_BASE_PATH=$(echo "$API_BASE_PATH" | sed 's/\/\/*/\//g')
 API_BASE="${PANEL_SCHEME}://127.0.0.1:${API_PORT}${API_BASE_PATH}"
 
-# 等待面板 Web 服务就绪（最多 30 秒，以能拿到 HTTP 状态码为准）
+# 等待面板 Web 服务就绪（最多 15 秒，以能拿到 HTTP 状态码为准）
 PANEL_READY=0
-for i in $(seq 1 30); do
+for i in $(seq 1 15); do
     READY_CODE=$(curl -sk --max-time 2 -o /dev/null -w "%{http_code}" "${API_BASE}login")
     if [ -n "$READY_CODE" ] && [ "$READY_CODE" != "000" ]; then
         PANEL_READY=1
@@ -420,36 +466,72 @@ for i in $(seq 1 30); do
     fi
     sleep 1
 done
-[ "$PANEL_READY" != "1" ] && echo "⚠️  警告: 面板 Web 服务 30 秒内未就绪，API 注入可能失败。"
+[ "$PANEL_READY" != "1" ] && echo "⚠️  警告: 面板 Web 服务 15 秒内未就绪，API 注入可能失败。"
 
 # settings/streamSettings/sniffing/allocate 需以 JSON 字符串形式嵌入请求体
 json_escape() {
     echo -n "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
-# 登录重试 5 次: 面板刚启动时首个请求可能超时/空响应, 失败时输出状态码便于诊断
-COOKIE_JAR=$(mktemp)
+# CHECK_PANEL_MODE=1 时验证登录。3x-ui v3.5.0 对 POST /login 启用了 CSRF：
+# 必须先 GET /csrf-token 获取与 Session Cookie 绑定的令牌，再带 Cookie 和
+# X-CSRF-Token 登录。后续 cookie 认证的 POST /panel/api/* 也必须带同一令牌。
+COOKIE_JAR=""
+CSRF_TOKEN=""
 API_OK=0
-for i in $(seq 1 5); do
-    LOGIN_RES=$(curl -sk -L --max-time 15 -c "$COOKIE_JAR" \
-        -w "\nHTTP_CODE:%{http_code}" -X POST "${API_BASE}login" \
-        --data-urlencode "username=${PANEL_USER}" --data-urlencode "password=${PANEL_PASS}")
-    LOGIN_CODE=$(echo "$LOGIN_RES" | sed -n 's/^HTTP_CODE://p')
-    if echo "$LOGIN_RES" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
-        API_OK=1
-        echo "✅ 面板 API 登录成功"
-        break
+if [ "$CHECK_PANEL_MODE" = "1" ]; then
+    COOKIE_JAR=$(mktemp)
+
+    LOGIN_RES=""
+    LOGIN_CODE=""
+    CSRF_RES=""
+    CSRF_CODE=""
+    for i in $(seq 1 5); do
+        # 每次重试重新获取 token，并使用同一个 cookie jar 保存对应 Session Cookie。
+        : > "$COOKIE_JAR"
+        CSRF_RES=$(curl -sk --max-time 15 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+            -H "X-Requested-With: XMLHttpRequest" \
+            -w "\nHTTP_CODE:%{http_code}" "${API_BASE}csrf-token")
+        CSRF_CODE=$(echo "$CSRF_RES" | sed -n 's/^HTTP_CODE://p')
+        CSRF_TOKEN=$(echo "$CSRF_RES" | sed -n 's/.*"obj"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
+        if [ "$CSRF_CODE" = "200" ] && [ -n "$CSRF_TOKEN" ]; then
+            LOGIN_RES=$(curl -sk --max-time 15 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+                -H "X-Requested-With: XMLHttpRequest" \
+                -H "X-CSRF-Token: $CSRF_TOKEN" \
+                -w "\nHTTP_CODE:%{http_code}" -X POST "${API_BASE}login" \
+                --data-urlencode "username=${PANEL_USER}" \
+                --data-urlencode "password=${PANEL_PASS}")
+            LOGIN_CODE=$(echo "$LOGIN_RES" | sed -n 's/^HTTP_CODE://p')
+            if echo "$LOGIN_RES" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
+                API_OK=1
+                echo "✅ 面板登录验证成功（CSRF + Session Cookie）"
+                break
+            fi
+        else
+            LOGIN_CODE="CSRF接口HTTP ${CSRF_CODE:-无}"
+        fi
+        [ "$i" -lt 5 ] && sleep 3
+    done
+
+    if [ "$API_OK" != "1" ]; then
+        echo "⚠️  警告: 面板登录验证失败（已重试 5 次, 最后状态: ${LOGIN_CODE:-无}）。"
+        [ -n "$LOGIN_RES" ] && echo "   返回内容: $(echo "$LOGIN_RES" | head -c 200)"
+        if [ "$INBOUND_MODE" = "1" ]; then
+            echo "   节点注入将自动使用数据库兜底。"
+        fi
     fi
-    [ "$i" -lt 5 ] && sleep 3
-done
-if [ "$API_OK" != "1" ]; then
-    echo "⚠️  警告: 面板 API 登录失败（已重试 5 次, 最后状态码: ${LOGIN_CODE:-无}），将回退为数据库方式注入。"
-    echo "   返回内容: $(echo "$LOGIN_RES" | head -c 200)"
+else
+    echo "ℹ️  CHECK_PANEL_MODE=0：已跳过面板登录验证。"
+    [ "$INBOUND_MODE" = "1" ] && echo "   未建立面板会话，节点注入将使用数据库兜底。"
 fi
 
 add_inbound_api() {
     local remark=$1 port=$2 protocol=$3 settings=$4 stream=$5
-    curl -sk --max-time 20 -b "$COOKIE_JAR" -H "Content-Type: application/json" \
+    curl -sk --max-time 20 -b "$COOKIE_JAR" \
+        -H "X-Requested-With: XMLHttpRequest" \
+        -H "X-CSRF-Token: $CSRF_TOKEN" \
+        -H "Content-Type: application/json" \
         -X POST "${API_BASE}panel/api/inbounds/add" \
         -d "{\"up\":0,\"down\":0,\"total\":0,\"remark\":\"$remark\",\"enable\":true,\"expiryTime\":0,\"listen\":\"\",\"port\":$port,\"protocol\":\"$protocol\",\"settings\":\"$(json_escape "$settings")\",\"streamSettings\":\"$(json_escape "$stream")\",\"sniffing\":\"$(json_escape "$SNIFFING")\",\"allocate\":\"$(json_escape "$ALLOCATE")\"}"
 }
@@ -486,14 +568,23 @@ add_inbound_sql() {
 NEED_RESTART=0
 inject_inbound() {
     local remark=$1 port=$2 protocol=$3 settings=$4 stream=$5 email=$6 uuid=$7 flow=$8 res=""
-    if [ "$API_OK" = "1" ]; then
+
+    # INBOUND_MODE=1 且面板已验证登录时优先走官方 API；其他情况直接走数据库。
+    if [ "$INBOUND_MODE" = "1" ] && [ "$API_OK" = "1" ]; then
         res=$(add_inbound_api "$remark" "$port" "$protocol" "$settings" "$stream")
         if echo "$res" | grep -q '"success"[[:space:]]*:[[:space:]]*true'; then
             echo "✅ 节点注入成功 (面板 API): $remark"
             return 0
         fi
         echo "⚠️  警告: API 注入失败 ($remark)，改用数据库兜底。返回: $(echo "$res" | head -c 200)"
+    elif [ "$INBOUND_MODE" = "0" ]; then
+        echo "ℹ️  INBOUND_MODE=0：直接使用数据库注入节点 ($remark)。"
+    elif [ "$CHECK_PANEL_MODE" = "0" ]; then
+        echo "ℹ️  未验证面板登录，使用数据库兜底注入节点 ($remark)。"
+    else
+        echo "ℹ️  面板登录未成功，使用数据库兜底注入节点 ($remark)。"
     fi
+
     add_inbound_sql "$remark" "$port" "$protocol" "$settings" "$stream" "$email" "$uuid" "$flow"
     if [ "$(sqlite3 $DB_PATH "SELECT COUNT(*) FROM inbounds WHERE port = $port;")" = "1" ]; then
         echo "✅ 节点注入成功 (数据库兜底): $remark"
@@ -509,9 +600,9 @@ VMESS_INJECTED=$?
 if [ "$VLESS_ENABLED" = "1" ]; then
     inject_inbound "$VLESS_REMARK" "$VLESS_PORT" "vless" "$VLESS_SETTINGS" "$VLESS_STREAM_SETTINGS" "vless_$VLESS_UUID" "$VLESS_UUID" "xtls-rprx-vision" || VLESS_ENABLED=0
 fi
-rm -f "$COOKIE_JAR"
+[ -n "$COOKIE_JAR" ] && rm -f "$COOKIE_JAR"
 
-# 数据库兜底写入过时必须重启面板才会加载; API 注入面板已热加载，重启一次作保险
+# 数据库兜底写入后必须重启面板才会加载; API 注入面板已热加载，重启一次作保险
 systemctl restart x-ui
 sleep 5
 
