@@ -21,8 +21,13 @@ PANEL_PORT=38438
 # 3x-ui 订阅服务端口
 SUB_PORT=2096
 
-# 3x-ui 面板路径， empty=默认路径
+# 3x-ui 面板路径，empty=默认路径
 PANEL_PATH="xui"
+
+# 3x-ui 安装版本：留空时通过 releases/latest 网页跳转解析，避免调用 GitHub API。
+# 服务器无法访问 GitHub 网页时使用备用稳定版本；也可手动指定，例如 "v3.6.0"。
+XUI_VERSION=""
+XUI_FALLBACK_VERSION="v3.6.0"
 
 # 是否验证面板登录: 0=不验证, 1=验证（默认）
 CHECK_PANEL_MODE=1
@@ -30,7 +35,7 @@ CHECK_PANEL_MODE=1
 # 节点注入方式: 0=直接使用数据库方式
 #               1=在 CHECK_PANEL_MODE=1 且登录成功时优先使用面板 API；
 #                 未验证、登录失败或 API 注入失败时自动使用数据库兜底
-INBOUND_MODE=1
+INBOUND_MODE=0
 # ==================================================================
 
 # 解析命令行参数
@@ -161,23 +166,41 @@ else
     export XUI_SSL_MODE=none
 fi
 
-# 先把官方安装脚本完整下载到本地再执行（避免 bash <(curl) 下载中断时静默跳过），
-# 整个安装流程最多重试 3 次：GitHub 下载发行包时断流会导致 tar 解压 EOF 报错，
-# 属于瞬时网络问题，重跑通常即可恢复。
+# 先把官方安装脚本完整下载到本地再执行。
+# 关键修复：最新版官方 install.sh 在无参数时会访问 api.github.com/releases/latest，
+# 传入明确版本后，官方脚本会跳过 API，直接下载 release 资源。
 INSTALLER="/tmp/3xui_install.sh"
 INSTALL_OK=0
+
+if [ -n "$XUI_VERSION" ]; then
+    XUI_INSTALL_VERSION="$XUI_VERSION"
+else
+    # 只读取 releases/latest 的 302 Location 响应头，不下载页面正文、不调用 GitHub API。
+    XUI_INSTALL_VERSION=$(curl -fsSI --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 60 \
+        https://github.com/MHSanaei/3x-ui/releases/latest 2>/dev/null \
+        | tr -d '\r' \
+        | sed -n 's#^[Ll]ocation: .*/tag/\([^/?]*\).*#\1#p' \
+        | tail -n 1)
+fi
+
+if ! echo "$XUI_INSTALL_VERSION" | grep -Eq '^v[0-9]+(\.[0-9]+){2,}$'; then
+    echo "⚠️  无法通过 releases/latest 获取版本号，使用备用版本 $XUI_FALLBACK_VERSION。"
+    XUI_INSTALL_VERSION="$XUI_FALLBACK_VERSION"
+fi
+echo "✅ 将安装 3x-ui 版本: $XUI_INSTALL_VERSION"
+
 for attempt in 1 2 3; do
     [ "$attempt" -gt 1 ] && echo "⚠️  安装未成功，10 秒后进行第 ${attempt}/3 次尝试..." && sleep 10
 
-    curl -Ls --retry 3 --retry-delay 2 --max-time 120 \
+    curl -fLsS --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
         -o "$INSTALLER" https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh
-    # 校验下载的确是脚本而非错误页/空文件
     if [ ! -s "$INSTALLER" ] || ! head -n 1 "$INSTALLER" | grep -q "^#!"; then
         echo "⚠️  安装脚本下载失败或内容异常。"
         continue
     fi
 
-    bash "$INSTALLER" < /dev/null
+    # 传入版本参数，绕过官方 install.sh 的 GitHub API latest 查询。
+    bash "$INSTALLER" "$XUI_INSTALL_VERSION" < /dev/null
 
     if [ -f /usr/local/x-ui/x-ui ]; then
         INSTALL_OK=1
@@ -187,8 +210,9 @@ done
 
 if [ "$INSTALL_OK" != "1" ]; then
     echo "❌ 严重错误: 3x-ui 安装失败（已重试 3 次，未找到 /usr/local/x-ui/x-ui）。"
-    echo "   常见原因是服务器访问 GitHub 不稳定导致发行包下载中断，"
-    echo "   请检查上方输出和网络状况后重新运行本脚本。"
+    echo "   当前版本: $XUI_INSTALL_VERSION"
+    echo "   请确认服务器可以访问 GitHub release 资源和 raw.githubusercontent.com。"
+    echo "   资源地址: https://github.com/MHSanaei/3x-ui/releases/download/${XUI_INSTALL_VERSION}/x-ui-linux-amd64.tar.gz"
     exit 1
 fi
 
